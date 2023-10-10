@@ -1,0 +1,207 @@
+/* This module is for migrations and jooq code generations.
+    Advantages to have them in one module:
+       1. Easy to track all migrations
+       2. Running test container for build just once
+       3. Generation code just once
+    Disadvantages:
+        1. All migrations are mixed together. So please add domain to the migration name
+        2. All external modules will have access to all generated code.
+ */
+
+
+import java.util.Optional
+import org.testcontainers.containers.PostgreSQLContainer
+
+buildscript {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath(libs.postgres.sql)
+        classpath(libs.flyway.core)
+        classpath(libs.test.container.postgres)
+        classpath(libs.dev.jna.platform)
+    }
+}
+
+plugins {
+    id 'java-library'
+    alias(libs.plugins.jooqGenerator)
+    alias(libs.plugins.flywayMigration)
+}
+
+group project.group + 'migration'
+
+configurations {
+    flywayMigration
+}
+
+dependencies {
+    jooqGenerator(libs.bundles.jooqGeneratorDependencies)
+}
+
+class FakeContainer {
+    public boolean isRunning() {
+        return false
+    }
+
+    public void stop() {}
+}
+
+task dbContainer {
+    var dbHostDefault = 'postgres'
+    var dbNameDefault = 'transaction-screening'
+    var dbPassDefault = 'postgres'
+    var dbUserDefault = 'postgres'
+
+    description """Either spins up a temporary Postgres database or uses a specified existing one.
+
+    |By default this task will spin up a new Docker Postgres database and expose credentials for
+    |it. However if the JOOQ_NO_TESTCONTAINER environment variable == 'true' (ignoring case) then
+    |it will not create anything and instead expose credentials based on the following environment
+    |variables:
+    |  POSTGRES_HOST (default: ${dbHostDefault}) - Can optionally include a port
+    |  POSTGRES_DB (default: ${dbNameDefault}) - Name of the DB to use
+    |  POSTGRES_PASSWORD (default: ${dbPassDefault})
+    |  POSTGRES_USER (default: ${dbUserDefault})""".stripMargin()
+
+    var noTestcontainer = Boolean.valueOf(System.getenv('JOOQ_NO_TESTCONTAINER'))
+
+    if (noTestcontainer) {
+        var dbHost = Optional.ofNullable(System.getenv('POSTGRES_HOST')).orElse(dbHostDefault)
+        var dbName = Optional.ofNullable(System.getenv('POSTGRES_DB')).orElse(dbNameDefault)
+
+        dbContainer.ext.dbUrl = "jdbc:postgresql://${dbHost}/${dbName}?loggerLevel=OFF"
+        dbContainer.ext.dbUsername = Optional.ofNullable(System.getenv('POSTGRES_USER')).orElse(dbUserDefault)
+        dbContainer.ext.dbPassword = Optional.ofNullable(System.getenv('POSTGRES_PASSWORD')).orElse(dbPassDefault)
+        dbContainer.ext.container = new FakeContainer()
+    } else {
+        var db = new PostgreSQLContainer("postgres:14.1")
+                .withUsername("postgres")
+                .withDatabaseName("transaction-screening")
+                .withPassword("postgres");
+        db.start()
+
+        gradle.buildFinished { result ->
+            if (db.isRunning()) {
+                db.stop()
+            }
+        }
+
+        dbContainer.ext.dbUrl = db.jdbcUrl
+        dbContainer.ext.dbUsername = db.username
+        dbContainer.ext.dbPassword = db.password
+        dbContainer.ext.container = db
+    }
+}
+
+flyway {
+    locations = ['filesystem:./src/main/resources/db/migration']
+    configurations = ['flywayMigration']
+    url = dbContainer.dbUrl
+    user = dbContainer.dbUsername
+    password = dbContainer.dbPassword
+}
+
+jooq {
+    version = libs.versions.jooq
+    configurations {
+        main {
+            generationTool {
+                logging = org.jooq.meta.jaxb.Logging.WARN
+                jdbc {
+                    driver = "org.postgresql.Driver"
+                    url = dbContainer.dbUrl
+                    user = dbContainer.dbUsername
+                    password = dbContainer.dbPassword
+                }
+                generator {
+                    name = 'org.jooq.codegen.DefaultGenerator'
+                    strategy {
+                        name = 'org.jooq.codegen.DefaultGeneratorStrategy'
+                    }
+                    generate {
+                        relations = true
+                        deprecated = false
+                        records = true
+                        javaTimeTypes = true
+                    }
+                    database {
+                        inputSchema = "public"
+                        forcedTypes {
+                            forcedType {
+                                name = 'Instant'
+                                includeTypes = '(?i:TIMESTAMP\\ WITH\\ TIME\\ ZONE)'
+                            }
+                        }
+                        properties {
+                            property {
+                                key = 'scripts'
+                                value = 'src/main/resources/db/migration/*.sql'
+                            }
+                            property {
+                                key = 'sort'
+                                value = 'flyway'
+                            }
+                            property {
+                                key = 'unqualifiedSchema'
+                                value = 'none'
+                            }
+                            property {
+                                key = 'defaultNameCase'
+                                value = 'lower'
+                            }
+                        }
+                    }
+                    target {
+                        packageName = 'com.complyadvantage.transaction.screening.db'
+                        directory = buildDir.toString() +'/generated/sources/jooq/main/java'
+                    }
+                }
+            }
+        }
+    }
+}
+
+tasks.named('flywayMigrate') {
+    dependsOn tasks.named("dbContainer")
+}
+tasks.named('generateJooq') {
+    dependsOn tasks.named("flywayMigrate")
+}
+
+tasks.generateJooq.doLast(
+        {
+            var db = dbContainer.container
+            if (db.isRunning()) {
+                db.stop()
+            }
+        }
+)
+
+task removeTestDatabaseContainer {
+    doLast {
+        var db = dbContainer.container
+        if (db.isRunning()) {
+            db.stop()
+        }
+    }
+}
+
+tasks.generateJooq.finalizedBy(removeTestDatabaseContainer)
+
+// configure jOOQ task such that it only executes when something has changed that potentially affects the generated JOOQ sources
+// - the jOOQ configuration has changed (Jdbc, Generator, Strategy, etc.)
+// - the classpath used to execute the jOOQ generation tool has changed (jOOQ library, database driver, strategy classes, etc.)
+// - the schema files from which the schema is generated and which is used by jOOQ to generate the sources have changed (scripts added, modified, etc.)
+tasks.named('generateJooq').configure {
+    // declare Flyway migration scripts as inputs on the jOOQ task
+    inputs.files(fileTree('src/main/resources/db/migration'))
+            .withPropertyName('migrations')
+            .withPathSensitivity(PathSensitivity.RELATIVE)
+
+    // make jOOQ task participate in incremental builds (and build caching)
+    allInputsDeclared = true
+}
